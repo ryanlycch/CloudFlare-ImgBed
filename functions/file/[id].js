@@ -9,7 +9,14 @@ export async function onRequest(context) {  // Contents of context object
         next, // used for middleware or to fetch assets
         data, // arbitrary space for passing data between middlewares
     } = context;
-    const TgFileID = params.id.split('.')[0]; // 文件 ID
+
+    try {
+        // 解码params.id
+        params.id = decodeURIComponent(params.id);
+    } catch (e) {
+        return new Response('Error: Decode Image ID Failed', { status: 400 });
+    }
+    
     const url = new URL(request.url);
     let Referer = request.headers.get('Referer')
     if (Referer) {
@@ -22,11 +29,11 @@ export async function onRequest(context) {  // Contents of context object
                     return domainPattern.test(refererUrl.hostname);
                 });
                 if (!isAllowed) {
-                    return Response.redirect(new URL("/block-img.html", request.url).href, 302); // Ensure URL is correctly formed
+                    return Response.redirect(new URL("/blockimg", request.url).href, 302); // Ensure URL is correctly formed
                 }
             }
         } catch (e) {
-            return Response.redirect(new URL("/block-img.html", request.url).href, 302); // Ensure URL is correctly formed
+            return Response.redirect(new URL("/blockimg", request.url).href, 302); // Ensure URL is correctly formed
         }
     }
     // 检查是否配置了 KV 数据库
@@ -34,22 +41,52 @@ export async function onRequest(context) {  // Contents of context object
         return new Response('Error: Please configure KV database', { status: 500 });
     }
     const imgRecord = await env.img_url.getWithMetadata(params.id);
+    // 如果meatdata不存在，只可能是之前未设置KV，且存储在Telegraph上的图片，那么在后面获取时会返回404错误，此处不用处理
+    
+    const fileName = imgRecord.metadata?.FileName || params.id;
+    const encodedFileName = encodeURIComponent(fileName);
+    const fileType = imgRecord.metadata?.FileType || null;
+    //const TgFileID = params.id.split('.')[0]; // 文件 ID
 
+    let TgFileID = ''; // Tg的file_id
     if (imgRecord.metadata?.Channel === 'Telegram') {
-        targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${imgRecord.metadata.TgFilePath}`;
+        // id为file_id + ext
+        TgFileID = params.id.split('.')[0];
+    } else if (imgRecord.metadata?.Channel === 'TelegramNew') {
+        // id为unique_id + file_name
+        TgFileID = imgRecord.metadata?.TgFileId;
+        if (TgFileID === null) {
+            return new Response('Error: Failed to fetch image', { status: 500 });
+        }
+    } else {
+        // 旧版telegraph
+    }
+
+    // 构建目标 URL
+    if (isTgChannel(imgRecord)) {
+        // 获取TG图片真实地址
+        const filePath = await getFilePath(env, TgFileID);
+        if (filePath === null) {
+            return new Response('Error: Failed to fetch image path', { status: 500 });
+        }
+        targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${filePath}`;
     } else {
         targetUrl = 'https://telegra.ph/' + url.pathname + url.search;
     }
-    const fileName = imgRecord.metadata?.FileName || 'file';
-    const encodedFileName = encodeURIComponent(fileName);
-    const fileType = imgRecord.metadata?.FileType || 'image/jpeg';
 
-    const response = await getFileContent(request, imgRecord, TgFileID, env, url);
+    const response = await getFileContent(request);
+    if (response === null) {
+        return new Response('Error: Failed to fetch image', { status: 500 });
+    } else if (response.status === 404) {
+        return new Response('Error: Image Not Found', { status: 404 });
+    }
     
     try {
         const headers = new Headers(response.headers);
-        headers.set('Content-Disposition', `inline; filename="${encodedFileName}"`);
-        headers.set('Content-Type', fileType);
+        headers.set('Content-Disposition', `inline; filename="${encodedFileName}"; filename*=UTF-8''${encodedFileName}`);
+        if (fileType) {
+            headers.set('Content-Type', fileType);
+        }
         const newRes =  new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
@@ -57,8 +94,8 @@ export async function onRequest(context) {  // Contents of context object
         });
 
         if (response.ok) {
-            // Referer header equal to the admin page
-            if (request.headers.get('Referer') == url.origin + "/admin") {
+            // Referer header equal to the dashboard page
+            if (request.headers.get('Referer') == url.origin + "/dashboard") {
                 //show the image
                 return newRes;
             }
@@ -75,22 +112,22 @@ export async function onRequest(context) {  // Contents of context object
                         console.log("Referer")
                         console.log(request.headers.get('Referer'))
                         if (typeof request.headers.get('Referer') == "undefined" || request.headers.get('Referer') == null || request.headers.get('Referer') == "") {
-                            return Response.redirect(url.origin + "/block-img.html", 302)
+                            return Response.redirect(url.origin + "/blockimg", 302)
                         } else {
-                            return Response.redirect("https://static-res.pages.dev/teleimage/img-block-compressed.png", 302)
+                            return new Response('Error: Image Blocked', { status: 404 });
                         }
 
                     } else if (record.metadata.Label == "adult") {
                         if (typeof request.headers.get('Referer') == "undefined" || request.headers.get('Referer') == null || request.headers.get('Referer') == "") {
-                            return Response.redirect(url.origin + "/block-img.html", 302)
+                            return Response.redirect(url.origin + "/blockimg", 302)
                         } else {
-                            return Response.redirect("https://static-res.pages.dev/teleimage/img-block-compressed.png", 302)
+                            return new Response('Error: Image Blocked', { status: 404 });
                         }
                     }
                     //check if the env variables WhiteList_Mode are set
                     if (env.WhiteList_Mode == "true") {
                         //if the env variables WhiteList_Mode are set, redirect to the image
-                        return Response.redirect(url.origin + "/whitelist-on.html", 302);
+                        return Response.redirect(url.origin + "/whiteliston", 302);
                     } else {
                         //if the env variables WhiteList_Mode are not set, redirect to the image
                         return newRes;
@@ -104,7 +141,7 @@ export async function onRequest(context) {  // Contents of context object
     }
 }
 
-async function getFileContent(request, imgRecord, file_id, env, url, max_retries = 2) {
+async function getFileContent(request, max_retries = 2) {
     let retries = 0;
     while (retries <= max_retries) {
         try {
@@ -115,23 +152,9 @@ async function getFileContent(request, imgRecord, file_id, env, url, max_retries
             });
             if (response.ok || response.status === 304) {
                 return response;
+            } else if (response.status === 404) {
+                return new Response('Error: Image Not Found', { status: 404 });
             } else {
-                // 若为TG渠道，更新TgFilePath
-                if (imgRecord.metadata?.Channel === 'Telegram') {
-                    const filePath = await getFilePath(env, file_id);
-                    if (filePath) {
-                        imgRecord.metadata.TgFilePath = filePath;
-                        await env.img_url.put(file_id, "", {
-                            metadata: imgRecord.metadata,
-                        });
-                        // 更新targetUrl
-                        if (imgRecord.metadata?.Channel === 'Telegram') {
-                            targetUrl = `https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${imgRecord.metadata.TgFilePath}`;
-                        } else {
-                            targetUrl = 'https://telegra.ph/' + url.pathname + url.search;
-                        }
-                    }
-                }
                 retries++;
             }
         } catch (error) {
@@ -161,4 +184,8 @@ async function getFilePath(env, file_id) {
       } catch (error) {
         return null;
       }
+}
+
+function isTgChannel(imgRecord) {
+    return imgRecord.metadata?.Channel === 'Telegram' || imgRecord.metadata?.Channel === 'TelegramNew';
 }

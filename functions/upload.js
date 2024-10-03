@@ -34,6 +34,9 @@ export async function onRequestPost(context) {  // Contents of context object
     const url = new URL(request.url);
     const clonedRequest = await request.clone();
 
+    // 获得上传IP
+    const uploadIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for") || request.headers.get("x-client-ip") || request.headers.get("x-host") || request.headers.get("x-originating-ip") || request.headers.get("x-cluster-client-ip") || request.headers.get("forwarded-for") || request.headers.get("forwarded") || request.headers.get("via") || request.headers.get("requester") || request.headers.get("true-client-ip") || request.headers.get("client-ip") || request.headers.get("x-remote-ip") || request.headers.get("x-originating-ip") || request.headers.get("fastly-client-ip") || request.headers.get("akamai-origin-hop") || request.headers.get("x-remote-ip") || request.headers.get("x-remote-addr") || request.headers.get("x-remote-host") || request.headers.get("x-client-ip") || request.headers.get("x-client-ips") || request.headers.get("x-client-ip")
+
     await errorHandling(context);
     telemetryData(context);
 
@@ -82,6 +85,11 @@ export async function onRequestPost(context) {  // Contents of context object
     // GIF 特殊处理
     if (fileType === 'image/gif' || fileType === 'image/webp' || fileExt === 'gif' || fileExt === 'webp') {
         sendFunction = {'url': 'sendAnimation', 'type': 'animation'};
+    }
+
+    // 从参数中获取serverCompress，如果为false，则使用sendDocument接口
+    if (url.searchParams.get('serverCompress') === 'false') {
+        sendFunction = {'url': 'sendDocument', 'type': 'document'};
     }
 
     // 优先从请求 URL 获取 authCode
@@ -142,26 +150,28 @@ export async function onRequestPost(context) {  // Contents of context object
         const clonedRes = await response.clone().json(); // 等待响应克隆和解析完成
         const fileInfo = getFile(clonedRes);
         const filePath = await getFilePath(env, fileInfo.file_id);
+
+        const time = new Date().getTime();
+        const id = fileInfo.file_id;
+        //const fullId = id + '.' + fileExt;
+        // 构建独一无二的 ID
+        const unique_index = time + Math.floor(Math.random() * 10000);
+        const fullId = fileName? unique_index + '_' + fileName : unique_index + '.' + fileExt;
         // 若上传成功，将响应返回给客户端
         if (response.ok) {
             res = new Response(
-                JSON.stringify([{ 'src': `/file/${fileInfo.file_id}.${fileExt}` }]), 
+                JSON.stringify([{ 'src': `/file/${fullId}` }]), 
                 {
                     status: 200,
                     headers: { 'Content-Type': 'application/json' }
                 }
             );
         }
-        const time = new Date().getTime();
-        // const src = clonedRes[0].src;
-        // const id = src.split('/').pop();
-        const id = fileInfo.file_id;
-        const fullId = id + '.' + fileExt;
         const apikey = env.ModerateContentApiKey;
     
         if (apikey == undefined || apikey == null || apikey == "") {
             await env.img_url.put(fullId, "", {
-                metadata: { FileName: fileName, FileType: fileType, ListType: "None", Label: "None", TimeStamp: time, Channel: "Telegram", TgFilePath: filePath },
+                metadata: { FileName: fileName, FileType: fileType, ListType: "None", Label: "None", TimeStamp: time, Channel: "TelegramNew", TgFileId: id, UploadIP: uploadIp },
             });
         } else {
             try {
@@ -171,7 +181,7 @@ export async function onRequestPost(context) {  // Contents of context object
                 }
                 const moderate_data = await fetchResponse.json();
                 await env.img_url.put(fullId, "", {
-                    metadata: { FileName: fileName, FileType: fileType, ListType: "None", Label: moderate_data.rating_label, TimeStamp: time, Channel: "Telegram", TgFilePath: filePath },
+                    metadata: { FileName: fileName, FileType: fileType, ListType: "None", Label: moderate_data.rating_label, TimeStamp: time, Channel: "TelegramNew", TgFileId: id, UploadIP: uploadIp },
                 });
             } catch (error) {
                 console.error('Moderate Error:', error);
@@ -207,6 +217,10 @@ function getFile(response) {
 		if (response.result.video) {
 			return getFileDetails(response.result.video);
 		}
+
+        if (response.result.audio) {
+            return getFileDetails(response.result.audio);
+        }
 
 		if (response.result.document) {
 			return getFileDetails(response.result.document);
