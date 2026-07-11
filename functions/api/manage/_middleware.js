@@ -1,106 +1,99 @@
+import { authenticate, AUTH_SCOPE } from "../../utils/auth/authCore.js";
+
+const DEFAULT_MANAGE_CACHE_CONTROL = 'private, no-store, max-age=0';
+
+function withDefaultCacheControl(response) {
+  if (response.headers.has('Cache-Control')) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', DEFAULT_MANAGE_CACHE_CONTROL);
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function errorHandling(context) {
-    try {
-      return await context.next();
-    } catch (err) {
-      return new Response(`${err.message}\n${err.stack}`, { status: 500 });
-    }
+  try {
+    return withDefaultCacheControl(await context.next());
+  } catch (err) {
+    return new Response(`${err.message}\n${err.stack}`, {
+      status: 500,
+      headers: {
+        'Cache-Control': DEFAULT_MANAGE_CACHE_CONTROL,
+      },
+    });
+  }
+}
+
+function UnauthorizedException(reason) {
+  return new Response(reason, {
+    status: 401,
+    statusText: 'Unauthorized',
+    headers: {
+      'Content-Type': 'text/plain;charset=UTF-8',
+      'Cache-Control': 'no-store',
+      'Content-Length': reason.length,
+    },
+  });
+}
+
+/**
+ * 根据请求路径提取所需权限
+ * @param {string} pathname - 请求路径
+ * @returns {string} 需要的权限类型
+ */
+function extractRequiredPermission(pathname) {
+  const pathParts = pathname.toLowerCase().split('/');
+
+  if (pathParts.includes('delete')) {
+    return 'delete';
   }
 
-  function basicAuthentication(request) {
-    const Authorization = request.headers.get('Authorization');
-  
-    const [scheme, encoded] = Authorization.split(' ');
-  
-    // The Authorization header must start with Basic, followed by a space.
-    if (!encoded || scheme !== 'Basic') {
-      throw new BadRequestException('Malformed authorization header.');
-    }
-  
-    // Decodes the base64 value and performs unicode normalization.
-    // @see https://datatracker.ietf.org/doc/html/rfc7613#section-3.3.2 (and #section-4.2.2)
-    // @see https://dev.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/String/normalize
-    const buffer = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
-    const decoded = new TextDecoder().decode(buffer).normalize();
-  
-    // The username & password are split by the first colon.
-    //=> example: "username:password"
-    const index = decoded.indexOf(':');
-  
-    // The user & password are split by the first colon and MUST NOT contain control characters.
-    // @see https://tools.ietf.org/html/rfc5234#appendix-B.1 (=> "CTL = %x00-1F / %x7F")
-    if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
-      throw new BadRequestException('Invalid authorization value.');
-    }
-  
-    return {
-      user: decoded.substring(0, index),
-      pass: decoded.substring(index + 1),
-    };
+  if (pathParts.includes('list')) {
+    return 'list';
   }
-  
-  function UnauthorizedException(reason) {
-    return new Response(reason, {
-        status: 401,
-        statusText: 'Unauthorized',
-        headers: {
-          'Content-Type': 'text/plain;charset=UTF-8',
-          // Disables caching by default.
-          'Cache-Control': 'no-store',
-          // Returns the "Content-Length" header for HTTP HEAD requests.
-          'Content-Length': reason.length,
-        },
-      });
-  }
-  
-  function BadRequestException(reason) {
-    return new Response(reason, {
-        status: 400,
-        statusText: 'Bad Request',
-        headers: {
-          'Content-Type': 'text/plain;charset=UTF-8',
-          // Disables caching by default.
-          'Cache-Control': 'no-store',
-          // Returns the "Content-Length" header for HTTP HEAD requests.
-          'Content-Length': reason.length,
-        },
-      });
-  }
-  
-  
-  function authentication(context) {
-    //context.env.BASIC_USER="admin"
-    //context.env.BASIC_PASS="admin"
-    //check if the env variables Disable_Dashboard are set
-    if (typeof context.env.img_url == "undefined" || context.env.img_url == null || context.env.img_url == "") {
-        return new Response('Dashboard is disabled. Please bind a KV namespace to use this feature.', { status: 200 });
-    }
 
-    console.log(context.env.BASIC_USER)
-    if(typeof context.env.BASIC_USER == "undefined" || context.env.BASIC_USER == null || context.env.BASIC_USER == ""){
-        return context.next();
-    }else{
-        if (context.request.headers.has('Authorization')) {
-            // Throws exception when authorization fails.
-            const { user, pass } = basicAuthentication(context.request);
-            
-                          
-                if (context.env.BASIC_USER !== user || context.env.BASIC_PASS !== pass) {
-                    return UnauthorizedException('Invalid credentials.');
-                }else{
-                    return context.next();
-                }
-            
-        } else {
-            return new Response('You need to login.', {
-                status: 401,
-                headers: {
-                // Prompts the user for credentials.
-                'WWW-Authenticate': 'Basic realm="my scope", charset="UTF-8"',
-                },
-            });
-        }
-    }  
-    
+  // 其他 /api/manage 下的操作需要管理权限
+  return 'manage';
+}
+
+// CORS 跨域响应头
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+async function authentication(context) {
+  // OPTIONS 预检请求不需要鉴权，直接返回 CORS 响应
+  if (context.request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders
+    });
   }
-  
-  export const onRequest = [errorHandling, authentication];
+
+  const pathname = new URL(context.request.url).pathname;
+  const requiredPermission = extractRequiredPermission(pathname);
+
+  const result = await authenticate({
+    env: context.env,
+    request: context.request,
+    requiredPermission,
+    authScope: AUTH_SCOPE.ADMIN,
+  });
+
+  if (!result.authorized) {
+    return UnauthorizedException('You need to login');
+  }
+
+  return context.next();
+}
+
+export const onRequest = [errorHandling, authentication];
